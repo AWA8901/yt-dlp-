@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Media Fetcher</title>
+<style>
+  :root {
+    --bg: #14161a;
+    --panel: #1b1e24;
+    --border: #2c3038;
+    --text: #d7dae0;
+    --dim: #7c8290;
+    --accent: #5fb3a3;
+    --danger: #d97070;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "SF Mono", "Consolas", "Menlo", monospace;
+    font-size: 14px;
+    display: flex;
+    justify-content: center;
+    padding: 48px 20px;
+  }
+  main { width: 100%; max-width: 560px; }
+  h1 {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: var(--dim);
+    margin: 0 0 24px;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  label {
+    display: block;
+    font-size: 12px;
+    color: var(--dim);
+    margin-bottom: 6px;
+  }
+  input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    padding: 9px 10px;
+    font: inherit;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  .field { margin-bottom: 14px; }
+  .field:last-child { margin-bottom: 0; }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  button {
+    width: 100%;
+    background: var(--accent);
+    border: none;
+    border-radius: 4px;
+    color: #0d1210;
+    font: inherit;
+    font-weight: 600;
+    padding: 10px;
+    cursor: pointer;
+    margin-top: 6px;
+  }
+  button:disabled { opacity: 0.4; cursor: default; }
+  .log {
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--dim);
+    white-space: pre-wrap;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+  .log .ok { color: var(--accent); }
+  .log .err { color: var(--danger); }
+  .hint {
+    font-size: 11.5px;
+    color: var(--dim);
+    margin-top: 8px;
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>media fetcher — yt-dlp via GitHub Actions</h1>
+
+  <div class="panel">
+    <div class="field">
+      <label>GitHub owner / repo</label>
+      <div class="row">
+        <div><input id="owner" placeholder="your-username"></div>
+        <div><input id="repo" placeholder="your-repo"></div>
+      </div>
+    </div>
+    <div class="field">
+      <label>Personal Access Token</label>
+      <input id="token" type="password" placeholder="github_pat_...">
+    </div>
+    <div class="hint">owner/repo とトークンはこの端末のブラウザにのみ保存されます(localStorage)。</div>
+  </div>
+
+  <div class="panel">
+    <div class="field">
+      <label>動画 URL</label>
+      <input id="url" placeholder="https://www.youtube.com/watch?v=...">
+    </div>
+    <button id="run">ダウンロード実行</button>
+  </div>
+
+  <div class="panel">
+    <div id="log" class="log">待機中。</div>
+  </div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const WORKFLOW_FILE = "download.yml";
+const BRANCH = "main";
+
+for (const id of ["owner", "repo", "token"]) {
+  $(id).value = localStorage.getItem(id) || "";
+  $(id).addEventListener("change", () => localStorage.setItem(id, $(id).value.trim()));
+}
+
+function log(msg, cls) {
+  const el = $("log");
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = msg;
+  if (el.textContent === "待機中。") el.textContent = "";
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+
+function api(owner, repo, path) {
+  return `https://api.github.com/repos/${owner}/${repo}${path}`;
+}
+
+function headers(token) {
+  return {
+    Authorization: `Bearer ${token}`,
+    Accept: "application/vnd.github+json",
+  };
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function dispatchWorkflow(owner, repo, token, url) {
+  const dispatchedAt = new Date();
+  const res = await fetch(
+    api(owner, repo, `/actions/workflows/${WORKFLOW_FILE}/dispatches`),
+    {
+      method: "POST",
+      headers: { ...headers(token), "Content-Type": "application/json" },
+      body: JSON.stringify({ ref: BRANCH, inputs: { url } }),
+    }
+  );
+  if (!res.ok) {
+    throw new Error(`ワークフロー起動に失敗 (${res.status}): ${await res.text()}`);
+  }
+  return dispatchedAt;
+}
+
+async function findRun(owner, repo, token, dispatchedAt) {
+  for (let i = 0; i < 15; i++) {
+    await sleep(2000);
+    const res = await fetch(
+      api(owner, repo, `/actions/workflows/${WORKFLOW_FILE}/runs?per_page=5`),
+      { headers: headers(token) }
+    );
+    const data = await res.json();
+    const run = (data.workflow_runs || []).find(
+      r => new Date(r.created_at) >= dispatchedAt
+    );
+    if (run) return run;
+  }
+  throw new Error("実行中のワークフローが見つかりませんでした");
+}
+
+async function waitForCompletion(owner, repo, token, runId) {
+  while (true) {
+    await sleep(5000);
+    const res = await fetch(api(owner, repo, `/actions/runs/${runId}`), {
+      headers: headers(token),
+    });
+    const run = await res.json();
+    log(`status: ${run.status}${run.conclusion ? " / " + run.conclusion : ""}`);
+    if (run.status === "completed") return run.conclusion;
+  }
+}
+
+async function downloadArtifact(owner, repo, token, runId) {
+  const res = await fetch(
+    api(owner, repo, `/actions/runs/${runId}/artifacts`),
+    { headers: headers(token) }
+  );
+  const { artifacts } = await res.json();
+  if (!artifacts || artifacts.length === 0) throw new Error("artifactが見つかりません");
+
+  const artifact = artifacts[0];
+  const zipRes = await fetch(artifact.archive_download_url, { headers: headers(token) });
+  const blob = await zipRes.blob();
+
+  const zip = await JSZip.loadAsync(blob);
+  const fileNames = Object.keys(zip.files).filter(n => !zip.files[n].dir);
+  if (fileNames.length === 0) throw new Error("zip内にファイルがありません");
+
+  const fileName = fileNames[0];
+  const fileBlob = await zip.files[fileName].async("blob");
+  const objectUrl = URL.createObjectURL(fileBlob);
+
+  const a = document.createElement("a");
+  a.href = objectUrl;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(objectUrl);
+
+  return fileName;
+}
+
+$("run").addEventListener("click", async () => {
+  const owner = $("owner").value.trim();
+  const repo = $("repo").value.trim();
+  const token = $("token").value.trim();
+  const url = $("url").value.trim();
+
+  $("log").textContent = "";
+  if (!owner || !repo || !token || !url) {
+    log("owner / repo / token / URL をすべて入力してください", "err");
+    return;
+  }
+
+  $("run").disabled = true;
+  try {
+    log("ワークフローを起動しています...");
+    const dispatchedAt = await dispatchWorkflow(owner, repo, token, url);
+
+    log("実行を検索しています...");
+    const run = await findRun(owner, repo, token, dispatchedAt);
+    log(`run #${run.id} を検出しました`);
+
+    const conclusion = await waitForCompletion(owner, repo, token, run.id);
+    if (conclusion !== "success") {
+      log(`ワークフローが失敗しました (${conclusion})`, "err");
+      log(`詳細: ${run.html_url}`);
+      return;
+    }
+
+    log("artifactを取得しています...");
+    const fileName = await downloadArtifact(owner, repo, token, run.id);
+    log(`完了: ${fileName} をダウンロードしました`, "ok");
+  } catch (e) {
+    log(String(e.message || e), "err");
+  } finally {
+    $("run").disabled = false;
+  }
+});
+</script>
+</body>
+</html>
